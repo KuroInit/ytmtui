@@ -24,7 +24,10 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Self {
-        let socket_path = format!("/tmp/ytmtui-mpv-{}.sock", std::process::id());
+        let socket_path = crate::auth::config_dir()
+            .join(format!("mpv-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
         Self {
             process: None,
             socket_path,
@@ -38,6 +41,11 @@ impl Player {
     /// Start `track_id`, using a prefetched stream URL when available. That
     /// skips the yt-dlp round-trip, so the next song starts almost instantly.
     pub fn play_with(&mut self, track_id: &str, stream_url: Option<&str>) -> anyhow::Result<()> {
+        let config_dir = crate::auth::private_config_dir()?;
+        self.socket_path = config_dir
+            .join(format!("mpv-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
         self.stop();
         // Remove a socket left by a previous process; otherwise mpv can't bind.
         let _ = std::fs::remove_file(&self.socket_path);

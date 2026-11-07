@@ -1,6 +1,6 @@
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,15 +23,38 @@ const API_KEY: &str = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 pub fn config_dir() -> PathBuf {
     static MIGRATE: Once = Once::new();
     MIGRATE.call_once(migrate_legacy);
-    if let Some(proj_dirs) = ProjectDirs::from("", "", "ytmtui") {
-        let dir = proj_dirs.config_dir().to_path_buf();
-        let _ = fs::create_dir_all(&dir);
-        dir
-    } else {
-        let dir = PathBuf::from(".ytmtui");
-        let _ = fs::create_dir_all(&dir);
-        dir
+    let dir = config_path();
+    let _ = ensure_private_dir(&dir);
+    dir
+}
+
+fn config_path() -> PathBuf {
+    ProjectDirs::from("", "", "ytmtui")
+        .map(|proj_dirs| proj_dirs.config_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".ytmtui"))
+}
+
+pub(crate) fn private_config_dir() -> io::Result<PathBuf> {
+    let dir = config_dir();
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
+fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "configuration path is not a real directory",
+        ));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// The app was called `ytm-tui` before; move its config directory once so the
@@ -227,7 +250,7 @@ impl Auth {
     }
 
     pub fn load_headers() -> Option<Map<String, Value>> {
-        let data = fs::read_to_string(auth_path()).ok()?;
+        let data = fs::read_to_string(private_config_dir().ok()?.join("auth.json")).ok()?;
         serde_json::from_str::<Value>(&data).ok()?.as_object().cloned()
     }
 
@@ -252,15 +275,20 @@ impl Auth {
 
 fn save_headers(headers: &Map<String, Value>) -> anyhow::Result<()> {
     let payload = serde_json::to_string_pretty(&Value::Object(headers.clone()))?;
-    let path = auth_path();
-    fs::write(&path, payload)?;
-    // Session cookies are credentials: keep them owner-only (0600), not at the
-    // umask default, which is usually world-readable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
+    let path = private_config_dir()?.join("auth.json");
+    atomic_write(&path, payload.as_bytes())?;
+    Ok(())
+}
+
+fn atomic_write(path: &Path, payload: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("credential path has no parent directory"))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(payload)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -631,4 +659,36 @@ fn setup_manual() -> anyhow::Result<bool> {
 
 fn looks_like_cookie_line(line: &str) -> bool {
     line.contains("SAPISID=") && line.contains(';')
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::{atomic_write, ensure_private_dir};
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn credential_write_is_atomic_private_and_replaces_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fs::write(&path, "old secret").unwrap();
+
+        atomic_write(&path, b"new secret").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new secret");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn configuration_directory_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_dir(&path).unwrap();
+
+        assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+    }
 }

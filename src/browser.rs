@@ -4,9 +4,7 @@
 //! the platform key where possible. Unreadable stores are skipped so the caller
 //! can try the next browser.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,7 +15,7 @@ use cbc::cipher::block_padding::Pkcs7;
 use cbc::Decryptor;
 use pbkdf2::pbkdf2_hmac;
 use rusqlite::types::Value as SqlValue;
-use rusqlite::Connection;
+use rusqlite::{Connection, DatabaseName, OpenFlags};
 use sha1::Sha1;
 
 type Aes128CbcDec = Decryptor<Aes128>;
@@ -169,28 +167,32 @@ fn db_candidates(root: &Path, kind: Kind) -> Vec<PathBuf> {
     out
 }
 
-/// Open a private copy of *src* (plus WAL/journal sidecars) so a running
-/// browser's locks can't block us and recent WAL data comes along.
-fn open_db_copy(src: &Path) -> Option<Connection> {
-    let mut hasher = DefaultHasher::new();
-    src.hash(&mut hasher);
-    let tag = hasher.finish();
-    let dir = std::env::temp_dir().join(format!("ytmtui-cookies-{tag:x}"));
-    fs::create_dir_all(&dir).ok()?;
-    let file_name = src.file_name()?.to_string_lossy().to_string();
-    let dst = dir.join(&file_name);
-    fs::copy(src, &dst).ok()?;
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let side = PathBuf::from(format!("{}{}", src.display(), suffix));
-        if side.exists() {
-            let _ = fs::copy(&side, dir.join(format!("{file_name}{suffix}")));
-        }
+struct DbCopy {
+    conn: Connection,
+    _dir: tempfile::TempDir,
+}
+
+/// Take a consistent SQLite online backup into a private, automatically
+/// cleaned temporary directory. This avoids racing copies of the DB and WAL.
+fn open_db_copy(src: &Path) -> Option<DbCopy> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("ytmtui-cookies-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
     }
-    Connection::open(&dst).ok()
+    let dir = builder.tempdir().ok()?;
+    let dst = dir.path().join(src.file_name()?);
+    let source = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    source.backup(DatabaseName::Main, &dst, None).ok()?;
+    let conn = Connection::open(&dst).ok()?;
+    Some(DbCopy { conn, _dir: dir })
 }
 
 fn is_youtube_host(host: &str) -> bool {
-    host.trim_start_matches('.').ends_with("youtube.com")
+    let host = host.strip_prefix('.').unwrap_or(host).to_ascii_lowercase();
+    !host.starts_with('.') && (host == "youtube.com" || host.ends_with(".youtube.com"))
 }
 
 fn clean(s: &str) -> bool {
@@ -254,8 +256,9 @@ fn decrypt_chrome_value(enc: &[u8], key: &[u8; 16]) -> Option<String> {
 }
 
 fn read_firefox(db: &Path) -> Option<Vec<(String, String)>> {
-    let conn = open_db_copy(db)?;
-    let mut stmt = conn
+    let copy = open_db_copy(db)?;
+    let mut stmt = copy
+        .conn
         .prepare("SELECT name, value, host FROM moz_cookies")
         .ok()?;
     let rows = stmt
@@ -284,9 +287,10 @@ fn read_firefox(db: &Path) -> Option<Vec<(String, String)>> {
 }
 
 fn read_chromium(db: &Path) -> Option<Vec<(String, String)>> {
-    let conn = open_db_copy(db)?;
+    let copy = open_db_copy(db)?;
     let key = chrome_key();
-    let mut stmt = conn
+    let mut stmt = copy
+        .conn
         .prepare("SELECT name, value, encrypted_value, host_key FROM cookies")
         .ok()?;
     let rows = stmt
@@ -366,4 +370,56 @@ pub fn cookie_header(cookies: &[(String, String)]) -> String {
         .map(|(n, v)| format!("{n}={v}"))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_youtube_host, open_db_copy};
+    use rusqlite::Connection;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn youtube_cookie_domain_requires_a_label_boundary() {
+        for host in ["youtube.com", ".youtube.com", ".music.youtube.com"] {
+            assert!(is_youtube_host(host), "expected {host} to be accepted");
+        }
+        for host in [
+            "notyoutube.com",
+            "youtube.com.evil.example",
+            ".youtube.com.evil.example",
+            "..youtube.com",
+        ] {
+            assert!(!is_youtube_host(host), "expected {host} to be rejected");
+        }
+    }
+
+    #[test]
+    fn sqlite_backup_uses_private_temp_dir_and_cleans_it_up() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("Cookies");
+        let source = Connection::open(&source_path).unwrap();
+        source
+            .execute("CREATE TABLE cookies (name TEXT)", [])
+            .unwrap();
+        source
+            .execute("INSERT INTO cookies VALUES ('session')", [])
+            .unwrap();
+        drop(source);
+
+        let copy = open_db_copy(&source_path).unwrap();
+        let temp_dir = copy._dir.path().to_path_buf();
+        assert_eq!(fs::metadata(&temp_dir).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            copy.conn
+                .query_row("SELECT name FROM cookies", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "session"
+        );
+
+        drop(copy);
+        assert!(!temp_dir.exists());
+    }
 }
